@@ -580,16 +580,23 @@ def format_section_title(group_df: pd.DataFrame) -> str:
 
 
 def render_confidence(confidence_value: float) -> None:
-    """Mostra la confidence media della newsletter sotto la tabella, in percentuale e con colore condizionale."""
+    """Mostra la confidence media della newsletter in percentuale, con colore e icona condizionale."""
     try:
         pct = round(float(confidence_value) * 100)
     except Exception:
         pct = 0
-    color = "#16803c" if pct >= 90 else "#c62828"
+
+    if pct >= 90:
+        color = "#16803c"
+        icon = "👍"
+    else:
+        color = "#c62828"
+        icon = "👎"
+
     st.markdown(
         f"<div style='font-size:0.90rem; margin-top:0.15rem;'>"
         f"<strong>Confidence media:</strong> "
-        f"<span style='color:{color}; font-weight:700;'>{pct}%</span>"
+        f"<span style='color:{color}; font-weight:700;'>{icon} {pct}%</span>"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -632,37 +639,155 @@ def merge_edited_section(original_group: pd.DataFrame, edited_display: pd.DataFr
 
     return merged
 
-def create_summary_text(df: pd.DataFrame) -> str:
+def parse_italian_date(value: str):
+    """Converte una data gg/mm/aaaa in pandas.Timestamp, se possibile."""
+    try:
+        return pd.to_datetime(str(value), dayfirst=True, errors="coerce")
+    except Exception:
+        return pd.NaT
+
+
+def get_week_label(df: pd.DataFrame) -> str:
+    """Restituisce una label tipo 'Week 25' sulla base delle date newsletter."""
+    if df.empty or "DATA NEWSLETTER" not in df.columns:
+        return "Week XX"
+    parsed_dates = [parse_italian_date(x) for x in df["DATA NEWSLETTER"].dropna().astype(str)]
+    parsed_dates = [x for x in parsed_dates if pd.notna(x)]
+    if not parsed_dates:
+        return "Week XX"
+    week_numbers = [int(x.isocalendar().week) for x in parsed_dates]
+    most_common_week = pd.Series(week_numbers).mode()
+    if most_common_week.empty:
+        return "Week XX"
+    return f"Week {int(most_common_week.iloc[0])}"
+
+
+def normalize_promo_for_mail(value: str) -> str:
+    """Normalizza leggermente la promozione per renderla più naturale nella mail."""
+    value = cleanup_field(value)
+    if not value:
+        return "promozione non specificata"
+    # Nei testi commerciali è più leggibile 'fino al -40%' rispetto a 'fino al 40%'.
+    value = re.sub(r"(?i)fino\s+al\s+(\d{1,2}\s?%)", r"fino al -\1", value)
+    value = re.sub(r"(?i)fino\s+a\s+(\d{1,2}\s?%)", r"fino al -\1", value)
+    value = re.sub(r"(?i)jusqu['’]à\s+(\d{1,2}\s?%)", r"fino al -\1", value)
+    value = value.replace("- ", "-")
+    return value
+
+
+def is_gnv_row(row: pd.Series) -> bool:
+    """Identifica righe in cui GNV risulta promossa in modo esplicito."""
+    company = str(row.get("COMPAGNIA PROMOSSA", ""))
+    subject = str(row.get("OGGETTO EMAIL", ""))
+    text = f"{company} {subject}"
+    return bool(re.search(r"(?i)(?<![A-Z])GNV(?![A-Z])", text))
+
+
+def format_market_and_promo(row: pd.Series) -> str:
+    destination = cleanup_field(row.get("DESTINAZIONE/MERCATO/TRATTA", ""))
+    promo = normalize_promo_for_mail(row.get("PROMOZIONE", ""))
+    if destination and promo:
+        return f"{destination} ({promo})"
+    if destination:
+        return destination
+    return promo
+
+
+def format_company_items(group_df: pd.DataFrame, max_items: int = 10) -> str:
+    """Crea una frase sintetica con compagnie, mercati/tratte e promozioni."""
+    items = []
+    for _, row in group_df.iterrows():
+        company = cleanup_field(row.get("COMPAGNIA PROMOSSA", ""))
+        market_promo = format_market_and_promo(row)
+        if company and market_promo:
+            item = f"{company} {market_promo}"
+        elif company:
+            item = company
+        else:
+            item = market_promo
+        if item and item not in items:
+            items.append(item)
+    if not items:
+        return "contenuti promozionali non chiaramente classificati"
+    if len(items) > max_items:
+        return "; ".join(items[:max_items]) + "; ulteriori promozioni rilevate"
+    return "; ".join(items)
+
+
+def create_mail_proposal(df: pd.DataFrame) -> str:
+    """Genera una proposta di mail settimanale al cliente, con focus sul posizionamento GNV."""
     if df.empty:
-        return "Nessuna newsletter analizzata."
-    n_files = df["FILE ORIGINE"].nunique()
-    n_rows = len(df)
-    olta_counts = df["OLTA MITTENTE"].value_counts().to_dict()
-    type_counts = df["TIPOLOGIA"].value_counts().to_dict()
+        return "Buongiorno Davide,\nriportiamo di seguito l’analisi OLTA Newsletter settimanale per la Week XX.\n\nNessuna newsletter analizzata."
 
-    olta_text = ", ".join(f"{olta}: {count}" for olta, count in olta_counts.items())
-    type_text = ", ".join(f"{typ}: {count}" for typ, count in type_counts.items())
+    work_df = df.copy()
+    for column in FINAL_COLUMNS:
+        if column not in work_df.columns:
+            work_df[column] = ""
 
-    promo_rows = df[df["TIPOLOGIA"].isin(["Promozione", "Codice sconto", "Reminder"])]
-    destinations = []
-    for value in promo_rows["DESTINAZIONE/MERCATO/TRATTA"].dropna().astype(str):
-        for item in re.split(r",|;", value):
-            item = item.strip()
-            if item and len(item) <= 60:
-                destinations.append(item)
-    top_dest = pd.Series(destinations).value_counts().head(5).to_dict() if destinations else {}
-    dest_text = ", ".join(f"{dest} ({count})" for dest, count in top_dest.items()) if top_dest else "non disponibile"
+    week_label = get_week_label(work_df)
+    n_files = work_df["FILE ORIGINE"].nunique()
+    gnv_df = work_df[work_df.apply(is_gnv_row, axis=1)].copy()
+    gnv_oltas = [x for x in gnv_df["OLTA MITTENTE"].dropna().astype(str).unique() if cleanup_field(x)]
 
-    return (
-        f"Nel periodo analizzato sono state caricate {n_files} newsletter e sono state estratte {n_rows} righe informative. "
-        f"La distribuzione per OLTA è la seguente: {olta_text}. "
-        f"Per tipologia, le comunicazioni risultano classificate come: {type_text}. "
-        f"I mercati/tratte più ricorrenti risultano: {dest_text}. "
-        "Il testo è generato automaticamente con regole Python e va considerato come bozza da revisionare."
-    )
+    if len(gnv_df) > 0:
+        if len(gnv_oltas) == 1:
+            opening_insight = f"Settimana con presenza GNV rilevata in particolare su {gnv_oltas[0]}."
+        elif len(gnv_oltas) > 1:
+            opening_insight = "Settimana con presenza GNV rilevata su " + ", ".join(gnv_oltas[:-1]) + f" e {gnv_oltas[-1]}."
+        else:
+            opening_insight = "Settimana con presenza GNV rilevata all’interno delle newsletter analizzate."
+    else:
+        opening_insight = "Settimana senza evidenze GNV esplicite nelle newsletter analizzate, ma utile per monitorare il posizionamento competitivo delle altre compagnie."
+
+    lines = [
+        "Buongiorno Davide,",
+        f"riportiamo di seguito l’analisi OLTA Newsletter settimanale per la {week_label}.",
+        opening_insight,
+        "",
+    ]
+
+    # Ordine per OLTA e data, preservando il più possibile l'ordine di caricamento/origine.
+    grouped = work_df.groupby(["OLTA MITTENTE", "DATA NEWSLETTER", "TIPOLOGIA", "FILE ORIGINE"], sort=False, dropna=False)
+    olta_order = [cleanup_field(x) for x in work_df["OLTA MITTENTE"].dropna().astype(str).unique() if cleanup_field(x)]
+
+    for olta in olta_order:
+        olta_df = work_df[work_df["OLTA MITTENTE"].astype(str) == olta]
+        if olta_df.empty:
+            continue
+        gnv_present = olta_df.apply(is_gnv_row, axis=1).any()
+        if gnv_present:
+            lines.append(f"• {olta}: GNV presente nelle comunicazioni analizzate")
+        else:
+            lines.append(f"• {olta}:")
+
+        for (g_olta, date, typology, file_origin), group in grouped:
+            if cleanup_field(g_olta) != olta:
+                continue
+            date = cleanup_field(date) or "data non rilevata"
+            group_gnv = group[group.apply(is_gnv_row, axis=1)]
+            group_non_gnv = group[~group.apply(is_gnv_row, axis=1)]
+
+            if not group_gnv.empty:
+                gnv_text = format_company_items(group_gnv)
+                if not group_non_gnv.empty:
+                    other_text = format_company_items(group_non_gnv)
+                    detail = f"GNV promossa su {gnv_text}. Il paniere include anche {other_text}."
+                else:
+                    detail = f"GNV promossa su {gnv_text}."
+            else:
+                detail = format_company_items(group)
+                detail = f"comunicazione non GNV-led, con focus su {detail}."
+
+            # Evita ripetizioni come 'GNV GNV Sicilia'.
+            detail = re.sub(r"(?i)GNV promossa su GNV\s+", "GNV promossa su ", detail)
+            lines.append(f"- {date}: {detail}")
+        lines.append("")
+
+    lines.append(f"Nel complesso, sono state analizzate {n_files} newsletter. La bozza è generata automaticamente con regole Python e va revisionata prima dell’invio al cliente.")
+    return "\n".join(lines).strip()
 
 
-def build_excel(df: pd.DataFrame, summary_text: str) -> BytesIO:
+def build_excel(df: pd.DataFrame, mail_text: str) -> BytesIO:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         export_df = df.copy()
@@ -681,18 +806,18 @@ def build_excel(df: pd.DataFrame, summary_text: str) -> BytesIO:
                 summary_rows.append({"Indicatore": f"Tipologia - {typ}", "Valore": count})
         summary_df = pd.DataFrame(summary_rows or [{"Indicatore": "Note", "Valore": "Nessun dato"}])
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
-        pd.DataFrame([{"Descrizione automatica": summary_text}]).to_excel(writer, sheet_name="Text summary", index=False)
+        pd.DataFrame([{"Proposta Mail": mail_text}]).to_excel(writer, sheet_name="Proposta Mail", index=False)
     output.seek(0)
     return output
 
 
 st.set_page_config(page_title="OLTA Newsletter Extractor", layout="wide")
 st.title("OLTA Newsletter Extractor")
-st.caption("Versione 0.2 — estrazione rule-based, senza modelli AI")
+st.caption("Versione 0.3 — estrazione rule-based, senza modelli AI")
 
 st.markdown(
     "Carica le newsletter in formato `.msg`, `.eml`, `.html` o `.txt`. "
-    "L'app creerà una sotto-sezione per ciascuna newsletter, con tabella modificabile, confidence e file di origine."
+    "L'app creerà una sotto-sezione per ciascuna newsletter, con tabella modificabile, confidence, file di origine e proposta mail finale."
 )
 
 uploaded_files = st.file_uploader(
@@ -763,11 +888,11 @@ if uploaded_files:
 
         edited_df = pd.concat(edited_groups, ignore_index=True) if edited_groups else pd.DataFrame(columns=FINAL_COLUMNS)
 
-        summary_text = create_summary_text(edited_df)
-        st.subheader("Descrizione testuale automatica")
-        summary_text = st.text_area("Bozza riepilogativa", value=summary_text, height=160)
+        mail_text = create_mail_proposal(edited_df)
+        st.subheader("Proposta Mail")
+        mail_text = st.text_area("Bozza mail al cliente", value=mail_text, height=360)
 
-        excel_data = build_excel(edited_df, summary_text)
+        excel_data = build_excel(edited_df, mail_text)
         st.download_button(
             "Scarica Excel",
             data=excel_data,
@@ -775,9 +900,9 @@ if uploaded_files:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
         st.download_button(
-            "Scarica descrizione TXT",
-            data=summary_text.encode("utf-8"),
-            file_name="OLTA_newsletter_summary.txt",
+            "Scarica proposta mail TXT",
+            data=mail_text.encode("utf-8"),
+            file_name="OLTA_newsletter_proposta_mail.txt",
             mime="text/plain",
         )
 else:

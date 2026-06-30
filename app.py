@@ -64,6 +64,21 @@ KNOWN_OLTAS = {
     "LA CENTRALE DES FERRIES": ["la centrale des ferries"],
 }
 
+APP_DIR = Path(__file__).parent
+LOGO_DIR = APP_DIR / "assets" / "logos"
+LOGO_WIDTH_PX = 165
+
+OLTA_LOGO_FILES = {
+    "AFERRY": "aferry.png",
+    "ALLOFERRY": "alloferry.png",
+    "FERRYHOPPER": "ferryhopper.png",
+    "NETFERRY": "netferry.png",
+    "TRAGHETTIPER": "traghettiper.png",
+    "TRAGHETTI.COM": "traghetti_com.png",
+    "DIRECT FERRIES": "direct_ferries.png",
+    "LA CENTRALE DES FERRIES": "la_centrale_des_ferries.png",
+}
+
 KNOWN_COMPANIES = [
     "GNV", "Grimaldi Lines", "Moby", "Tirrenia", "Corsica Ferries", "Sardinia Ferries",
     "Corsica Linea", "La Méridionale", "La Meridionale", "Tallink Silja Line",
@@ -612,6 +627,31 @@ def render_source_file(file_name: str) -> None:
     )
 
 
+def get_logo_path(olta: str) -> Path | None:
+    """Restituisce il path del logo associato all'OLTA, se disponibile."""
+    olta = cleanup_field(olta).upper()
+    filename = OLTA_LOGO_FILES.get(olta)
+    if not filename:
+        return None
+    logo_path = LOGO_DIR / filename
+    return logo_path if logo_path.exists() else None
+
+
+def render_newsletter_header(group_df: pd.DataFrame, section_title: str) -> None:
+    """Mostra logo OLTA + titolo della sotto-sezione newsletter."""
+    olta = cleanup_field(group_df["OLTA MITTENTE"].dropna().astype(str).iloc[0]) if not group_df.empty else ""
+    logo_path = get_logo_path(olta)
+
+    if logo_path:
+        logo_col, title_col = st.columns([1, 5])
+        with logo_col:
+            st.image(str(logo_path), width=LOGO_WIDTH_PX)
+        with title_col:
+            st.markdown(f"### {section_title}")
+    else:
+        st.markdown(f"### {section_title}")
+
+
 def merge_edited_section(original_group: pd.DataFrame, edited_display: pd.DataFrame) -> pd.DataFrame:
     """Ricompatta le modifiche della sotto-tabella con le colonne tecniche nascoste."""
     merged = original_group.copy().reset_index(drop=True)
@@ -813,7 +853,7 @@ def build_excel(df: pd.DataFrame, mail_text: str) -> BytesIO:
 
 st.set_page_config(page_title="OLTA Newsletter Extractor", layout="wide")
 st.title("OLTA Newsletter Extractor")
-st.caption("Versione 0.3 — estrazione rule-based, senza modelli AI")
+st.caption("Versione 0.4 — estrazione rule-based, loghi OLTA integrati, senza modelli AI")
 
 st.markdown(
     "Carica le newsletter in formato `.msg`, `.eml`, `.html` o `.txt`. "
@@ -856,7 +896,7 @@ if uploaded_files:
             group_df = group_df.reset_index(drop=True)
             section_title = format_section_title(group_df)
 
-            st.markdown(f"### {section_title}")
+            render_newsletter_header(group_df, section_title)
 
             display_df = group_df.copy()
             for column in DISPLAY_COLUMNS:

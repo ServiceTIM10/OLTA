@@ -29,6 +29,30 @@ FINAL_COLUMNS = [
     "NOTE",
 ]
 
+# Colonne visibili nelle sotto-tabelle dell'app.
+# Le colonne tecniche FILE ORIGINE, CONFIDENCE, TESTO ESTRATTO e NOTE restano disponibili
+# internamente, ma non vengono mostrate come colonne nelle tabelle modificabili.
+DISPLAY_COLUMNS = [
+    "COMPAGNIA PROMOSSA",
+    "DESTINAZIONE/MERCATO/TRATTA",
+    "PROMOZIONE",
+    "OGGETTO EMAIL",
+]
+
+# Colonne esportate nel file Excel finale.
+# TESTO ESTRATTO e NOTE sono escluse perché richiesto di eliminarle dalle tabelle operative.
+EXPORT_COLUMNS = [
+    "OLTA MITTENTE",
+    "DATA NEWSLETTER",
+    "TIPOLOGIA",
+    "COMPAGNIA PROMOSSA",
+    "DESTINAZIONE/MERCATO/TRATTA",
+    "PROMOZIONE",
+    "OGGETTO EMAIL",
+    "FILE ORIGINE",
+    "CONFIDENCE",
+]
+
 KNOWN_OLTAS = {
     "AFERRY": ["aferry", "anna aferry"],
     "ALLOFERRY": ["allo ferry", "alloferry"],
@@ -545,6 +569,69 @@ def extract_rows(parsed: dict, filename: str) -> list[dict]:
     return cleaned
 
 
+
+def format_section_title(group_df: pd.DataFrame) -> str:
+    """Crea il titolo della sotto-sezione: [OLTA] - [DATA MAIL] - [TIPOLOGIA]."""
+    olta = cleanup_field(group_df["OLTA MITTENTE"].dropna().astype(str).iloc[0]) if not group_df.empty else "OLTA non rilevata"
+    date = cleanup_field(group_df["DATA NEWSLETTER"].dropna().astype(str).iloc[0]) if not group_df.empty else "Data non rilevata"
+    tipologie = [cleanup_field(x) for x in group_df["TIPOLOGIA"].dropna().astype(str).unique() if cleanup_field(x)]
+    tipologia = " / ".join(tipologie) if tipologie else "Tipologia non rilevata"
+    return f"{olta or 'OLTA non rilevata'} - {date or 'Data non rilevata'} - {tipologia}"
+
+
+def render_confidence(confidence_value: float) -> None:
+    """Mostra la confidence media della newsletter sotto la tabella, in percentuale e con colore condizionale."""
+    try:
+        pct = round(float(confidence_value) * 100)
+    except Exception:
+        pct = 0
+    color = "#16803c" if pct >= 90 else "#c62828"
+    st.markdown(
+        f"<div style='font-size:0.90rem; margin-top:0.15rem;'>"
+        f"<strong>Confidence media:</strong> "
+        f"<span style='color:{color}; font-weight:700;'>{pct}%</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_source_file(file_name: str) -> None:
+    """Mostra il file di origine sotto la tabella in formato piccolo."""
+    st.markdown(
+        f"<div style='font-size:0.78rem; color:#6b7280; margin-top:0.05rem;'>"
+        f"File di origine: {file_name}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def merge_edited_section(original_group: pd.DataFrame, edited_display: pd.DataFrame) -> pd.DataFrame:
+    """Ricompatta le modifiche della sotto-tabella con le colonne tecniche nascoste."""
+    merged = original_group.copy().reset_index(drop=True)
+    edited_display = edited_display.reset_index(drop=True)
+
+    # Se l'utente aggiunge righe nella sotto-tabella, creiamo nuove righe usando i metadati
+    # della newsletter di partenza e riempiamo le colonne visibili con i valori editati.
+    if len(edited_display) > len(merged):
+        template = merged.iloc[0].to_dict() if not merged.empty else {col: "" for col in FINAL_COLUMNS}
+        extra_rows = []
+        for _ in range(len(edited_display) - len(merged)):
+            new_row = template.copy()
+            for col in DISPLAY_COLUMNS:
+                new_row[col] = ""
+            extra_rows.append(new_row)
+        merged = pd.concat([merged, pd.DataFrame(extra_rows)], ignore_index=True)
+
+    # Se l'utente elimina righe dalla sotto-tabella, manteniamo solo lo stesso numero di righe.
+    if len(edited_display) < len(merged):
+        merged = merged.iloc[:len(edited_display)].copy().reset_index(drop=True)
+
+    for col in DISPLAY_COLUMNS:
+        if col in edited_display.columns:
+            merged[col] = edited_display[col].values
+
+    return merged
+
 def create_summary_text(df: pd.DataFrame) -> str:
     if df.empty:
         return "Nessuna newsletter analizzata."
@@ -578,7 +665,12 @@ def create_summary_text(df: pd.DataFrame) -> str:
 def build_excel(df: pd.DataFrame, summary_text: str) -> BytesIO:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Database", index=False)
+        export_df = df.copy()
+        for column in EXPORT_COLUMNS:
+            if column not in export_df.columns:
+                export_df[column] = ""
+        export_df = export_df[EXPORT_COLUMNS]
+        export_df.to_excel(writer, sheet_name="Database", index=False)
         summary_rows = []
         if not df.empty:
             summary_rows.append({"Indicatore": "Newsletter caricate", "Valore": df["FILE ORIGINE"].nunique()})
@@ -596,11 +688,11 @@ def build_excel(df: pd.DataFrame, summary_text: str) -> BytesIO:
 
 st.set_page_config(page_title="OLTA Newsletter Extractor", layout="wide")
 st.title("OLTA Newsletter Extractor")
-st.caption("Versione 0.1 — estrazione rule-based, senza modelli AI")
+st.caption("Versione 0.2 — estrazione rule-based, senza modelli AI")
 
 st.markdown(
     "Carica le newsletter in formato `.msg`, `.eml`, `.html` o `.txt`. "
-    "L'app estrarrà una tabella modificabile e genererà un file Excel con Database, Summary e descrizione testuale."
+    "L'app creerà una sotto-sezione per ciascuna newsletter, con tabella modificabile, confidence e file di origine."
 )
 
 uploaded_files = st.file_uploader(
@@ -626,20 +718,50 @@ if uploaded_files:
     if df.empty:
         st.info("Nessuna informazione estratta dai file caricati.")
     else:
-        st.subheader("Tabella estratta - modificabile")
-        st.write("Controlla soprattutto le righe con confidence bassa o media.")
-        edited_df = st.data_editor(
-            df,
-            use_container_width=True,
-            num_rows="dynamic",
-            column_config={
-                "TIPOLOGIA": st.column_config.SelectboxColumn(
-                    "TIPOLOGIA",
-                    options=["Promozione", "Codice sconto", "Reminder", "Comunicazione generica"],
-                ),
-                "CONFIDENCE": st.column_config.NumberColumn("CONFIDENCE", min_value=0.0, max_value=1.0, step=0.05),
-            },
+        st.subheader("Newsletter estratte - tabelle modificabili")
+        st.write(
+            "Ogni sezione corrisponde a una singola newsletter. "
+            "Le colonne tecniche non sono mostrate nella tabella, ma vengono usate per il riepilogo e l'export."
         )
+
+        edited_groups = []
+        grouped = df.groupby("FILE ORIGINE", sort=False, dropna=False)
+
+        for section_idx, (file_origin, group_df) in enumerate(grouped, start=1):
+            group_df = group_df.reset_index(drop=True)
+            section_title = format_section_title(group_df)
+
+            st.markdown(f"### {section_title}")
+
+            display_df = group_df.copy()
+            for column in DISPLAY_COLUMNS:
+                if column not in display_df.columns:
+                    display_df[column] = ""
+            display_df = display_df[DISPLAY_COLUMNS]
+
+            edited_display = st.data_editor(
+                display_df,
+                use_container_width=True,
+                num_rows="dynamic",
+                key=f"newsletter_table_{section_idx}_{file_origin}",
+                column_config={
+                    "COMPAGNIA PROMOSSA": st.column_config.TextColumn("COMPAGNIA PROMOSSA"),
+                    "DESTINAZIONE/MERCATO/TRATTA": st.column_config.TextColumn("DESTINAZIONE/MERCATO/TRATTA"),
+                    "PROMOZIONE": st.column_config.TextColumn("PROMOZIONE"),
+                    "OGGETTO EMAIL": st.column_config.TextColumn("OGGETTO EMAIL"),
+                },
+            )
+
+            confidence_mean = group_df["CONFIDENCE"].dropna().astype(float).mean() if "CONFIDENCE" in group_df else 0
+            render_confidence(confidence_mean)
+            render_source_file(str(file_origin))
+
+            edited_group = merge_edited_section(group_df, edited_display)
+            edited_groups.append(edited_group)
+
+            st.divider()
+
+        edited_df = pd.concat(edited_groups, ignore_index=True) if edited_groups else pd.DataFrame(columns=FINAL_COLUMNS)
 
         summary_text = create_summary_text(edited_df)
         st.subheader("Descrizione testuale automatica")

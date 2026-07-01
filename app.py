@@ -12,6 +12,23 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 try:
+    from pptx import Presentation
+    from pptx.chart.data import CategoryChartData
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+    from pptx.util import Inches, Pt
+except Exception:
+    Presentation = None
+    CategoryChartData = None
+    RGBColor = None
+    PP_ALIGN = None
+    MSO_ANCHOR = None
+    Inches = None
+    Pt = None
+
+from copy import deepcopy
+
+try:
     import extract_msg
 except Exception:
     extract_msg = None
@@ -88,6 +105,37 @@ OLTA_LOGO_FILES = {
     "DIRECT FERRIES": ["direct_ferries.png", "DIRECT FERRIES.png", "direct ferries.png"],
     "LA CENTRALE DES FERRIES": ["la_centrale_des_ferries.png", "LA CENTRALE DES FERRIES.png"],
 }
+
+TEMPLATE_PPTX_CANDIDATES = [
+    APP_DIR / "templates" / "template_olta.pptx",
+    APP_DIR / "template_olta.pptx",
+    Path.cwd() / "templates" / "template_olta.pptx",
+    Path.cwd() / "template_olta.pptx",
+]
+
+PPT_OLTA_CATEGORIES = [
+    "ADAC",
+    "AFERRY",
+    "ALLOFERRY",
+    "DIRECT FERRIES",
+    "FERRY HOPPER",
+    "LA CENTRALE DES FERRIES",
+    "NETFERRY",
+    "TRAGHETTIPER",
+    "TRAGHETTI.COM",
+]
+
+PPT_BAR_COLORS = [
+    (31, 78, 121),
+    (112, 173, 71),
+    (237, 125, 49),
+    (91, 155, 213),
+    (165, 165, 165),
+    (255, 192, 0),
+    (68, 114, 196),
+    (112, 48, 160),
+    (0, 176, 80),
+]
 
 KNOWN_COMPANIES = [
     "GNV", "Grimaldi Lines", "Moby", "Tirrenia", "Corsica Ferries", "Sardinia Ferries",
@@ -1040,6 +1088,351 @@ def create_mail_proposal(df: pd.DataFrame) -> str:
     return "\n".join(lines).strip()
 
 
+
+def normalize_olta_for_ppt(value: str) -> str:
+    """Restituisce la label OLTA coerente con il template PowerPoint."""
+    key = normalize_logo_key(value)
+    mapping = {
+        "ferryhopper": "FERRY HOPPER",
+        "aferry": "AFERRY",
+        "alloferry": "ALLOFERRY",
+        "directferries": "DIRECT FERRIES",
+        "lacentraledesferries": "LA CENTRALE DES FERRIES",
+        "lacentrale": "LA CENTRALE DES FERRIES",
+        "netferry": "NETFERRY",
+        "traghettiper": "TRAGHETTIPER",
+        "traghetticom": "TRAGHETTI.COM",
+        "adac": "ADAC",
+    }
+    return mapping.get(key, cleanup_field(value).upper())
+
+
+def get_template_pptx_path() -> Path | None:
+    """Cerca il template PowerPoint in templates/ o nella root dell'app."""
+    for candidate in TEMPLATE_PPTX_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def get_week_info(df: pd.DataFrame) -> dict:
+    """Calcola numero settimana e intervallo lunedì-domenica dalle date newsletter."""
+    parsed_dates = []
+    if not df.empty and "DATA NEWSLETTER" in df.columns:
+        for value in df["DATA NEWSLETTER"].dropna().astype(str):
+            dt = parse_italian_date(value)
+            if pd.notna(dt):
+                parsed_dates.append(dt)
+    if not parsed_dates:
+        return {
+            "week_number": "XX",
+            "week_label": "Week XX",
+            "monday": None,
+            "sunday": None,
+            "friday": None,
+            "date_range": "lunedì gg/mm/aaaa - domenica gg/mm/aaaa",
+        }
+
+    week_numbers = [int(x.isocalendar().week) for x in parsed_dates]
+    week_number = int(pd.Series(week_numbers).mode().iloc[0])
+    reference_dates = [x for x in parsed_dates if int(x.isocalendar().week) == week_number]
+    reference = min(reference_dates) if reference_dates else min(parsed_dates)
+    monday = reference - pd.Timedelta(days=int(reference.weekday()))
+    sunday = monday + pd.Timedelta(days=6)
+    date_range = f"lunedì {monday.strftime('%d/%m/%Y')} - domenica {sunday.strftime('%d/%m/%Y')}"
+    return {
+        "week_number": str(week_number),
+        "week_label": f"Week {week_number}",
+        "monday": monday,
+        "sunday": sunday,
+        "friday": sunday,
+        "date_range": date_range,
+    }
+
+
+def get_communication_counts_for_ppt(df: pd.DataFrame) -> list[int]:
+    """Conta le comunicazioni per OLTA come numero di newsletter/file, non come righe promozione."""
+    counts = {olta: 0 for olta in PPT_OLTA_CATEGORIES}
+    if df.empty:
+        return [0 for _ in PPT_OLTA_CATEGORIES]
+
+    if "FILE ORIGINE" in df.columns:
+        newsletter_df = df.groupby("FILE ORIGINE", sort=False, dropna=False).agg({"OLTA MITTENTE": "first"}).reset_index()
+    else:
+        newsletter_df = df.copy()
+
+    for value in newsletter_df.get("OLTA MITTENTE", pd.Series(dtype=str)).fillna("").astype(str):
+        olta = normalize_olta_for_ppt(value)
+        if olta not in counts:
+            counts[olta] = 0
+        counts[olta] += 1
+    return [int(counts.get(olta, 0)) for olta in PPT_OLTA_CATEGORIES]
+
+
+def replace_text_in_slide(slide, replacements: dict[str, str]) -> None:
+    """Sostituisce testo nei textbox mantenendo la struttura semplice del template."""
+    for shape in slide.shapes:
+        if not hasattr(shape, "text"):
+            continue
+        original = shape.text
+        if not original:
+            continue
+        updated = original
+        for old, new in replacements.items():
+            updated = updated.replace(old, new)
+        if updated != original:
+            shape.text = updated
+
+
+def remove_shape(shape) -> None:
+    """Rimuove una shape da una slide."""
+    element = shape._element
+    element.getparent().remove(element)
+
+
+def duplicate_slide(prs, source_slide):
+    """Duplica una slide preservando le forme del template.
+
+    La slide dettaglio del template contiene solo forme, testo e tabella placeholder;
+    non è necessario ricopiare manualmente le relazioni, che in python-pptx 1.x
+    usano API interne diverse a seconda della versione.
+    """
+    blank_layout = prs.slide_layouts[6]
+    copied_slide = prs.slides.add_slide(blank_layout)
+    for shape in source_slide.shapes:
+        new_el = deepcopy(shape.element)
+        copied_slide.shapes._spTree.insert_element_before(new_el, "p:extLst")
+    return copied_slide
+
+
+def update_title_slide(slide, week_info: dict) -> None:
+    replace_text_in_slide(
+        slide,
+        {
+            "Week [numero Settimana]": f"Week {week_info['week_number']}",
+            "lunedì gg/mm/aaaa - domenica gg/mm/aaaa": week_info["date_range"],
+            "lunedì gg/mm/aaaa - venerdì gg/mm/aaaa": week_info["date_range"],
+        },
+    )
+
+
+def update_summary_chart_slide(slide, week_info: dict, df: pd.DataFrame) -> None:
+    replace_text_in_slide(slide, {"Week [numero Settimana]": f"Week {week_info['week_number']}"})
+    counts = get_communication_counts_for_ppt(df)
+    for shape in slide.shapes:
+        if not getattr(shape, "has_chart", False):
+            continue
+        chart = shape.chart
+        chart_data = CategoryChartData()
+        chart_data.categories = PPT_OLTA_CATEGORIES
+        chart_data.add_series("Invii", counts)
+        chart.replace_data(chart_data)
+        try:
+            series = chart.series[0]
+            for idx, point in enumerate(series.points):
+                fill = point.format.fill
+                fill.solid()
+                r, g, b = PPT_BAR_COLORS[idx % len(PPT_BAR_COLORS)]
+                fill.fore_color.rgb = RGBColor(r, g, b)
+        except Exception:
+            pass
+        break
+
+
+def newsletter_group_title(group_df: pd.DataFrame) -> str:
+    date = cleanup_field(group_df["DATA NEWSLETTER"].dropna().astype(str).iloc[0]) if not group_df.empty else "gg/mm/aaaa"
+    tipologie = [cleanup_field(x) for x in group_df["TIPOLOGIA"].dropna().astype(str).unique() if cleanup_field(x)] if not group_df.empty else []
+    tipologia = " / ".join(tipologie) if tipologie else "tipologia newsletter"
+    return f"Newsletter {date} – {tipologia}"
+
+
+def pack_newsletter_groups_for_ppt(df: pd.DataFrame) -> list[list[pd.DataFrame]]:
+    """Raggruppa le newsletter in slide. Max 2 tabelle per slide se stessa OLTA e tabelle brevi."""
+    groups = []
+    for _, group_df in df.groupby("FILE ORIGINE", sort=False, dropna=False):
+        groups.append(group_df.reset_index(drop=True))
+
+    chunks = []
+    i = 0
+    while i < len(groups):
+        current = groups[i]
+        current_olta = cleanup_field(current["OLTA MITTENTE"].dropna().astype(str).iloc[0]) if not current.empty else ""
+        if i + 1 < len(groups):
+            nxt = groups[i + 1]
+            next_olta = cleanup_field(nxt["OLTA MITTENTE"].dropna().astype(str).iloc[0]) if not nxt.empty else ""
+            same_olta = normalize_olta_for_ppt(current_olta) == normalize_olta_for_ppt(next_olta)
+            if same_olta and len(current) <= 5 and len(nxt) <= 5:
+                chunks.append([current, nxt])
+                i += 2
+                continue
+        chunks.append([current])
+        i += 1
+    return chunks
+
+
+def set_cell_text(cell, value: str, bold: bool = False, font_size: int = 10, header: bool = False) -> None:
+    value = cleanup_field(value)
+    cell.text = value
+    try:
+        cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+    except Exception:
+        pass
+    for paragraph in cell.text_frame.paragraphs:
+        paragraph.alignment = PP_ALIGN.CENTER if header else PP_ALIGN.LEFT
+        for run in paragraph.runs:
+            run.font.bold = bold
+            run.font.size = Pt(font_size)
+            run.font.name = "Arial"
+            if header:
+                run.font.color.rgb = RGBColor(255, 255, 255)
+            else:
+                run.font.color.rgb = RGBColor(35, 35, 35)
+
+
+def add_ppt_table(slide, group_df: pd.DataFrame, left, top, width, height, compact: bool = False) -> None:
+    """Aggiunge una tabella PowerPoint con colonne Compagnia / Destinazione / Sconto."""
+    rows = max(2, len(group_df) + 1)
+    cols = 3
+    table_shape = slide.shapes.add_table(rows, cols, left, top, width, height)
+    table = table_shape.table
+
+    table.columns[0].width = int(width * 0.25)
+    table.columns[1].width = int(width * 0.50)
+    table.columns[2].width = int(width * 0.25)
+
+    header_font = 9 if compact else 10
+    body_font = 8 if compact else 10
+    headers = ["COMPAGNIA", "DESTINAZIONE / TRATTA / MERCATO", "SCONTO"]
+    for c, header in enumerate(headers):
+        cell = table.cell(0, c)
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = RGBColor(31, 78, 121)
+        set_cell_text(cell, header, bold=True, font_size=header_font, header=True)
+
+    for r_idx, (_, row) in enumerate(group_df.iterrows(), start=1):
+        values = [
+            row.get("COMPAGNIA PROMOSSA", ""),
+            row.get("DESTINAZIONE/MERCATO/TRATTA", ""),
+            row.get("PROMOZIONE", ""),
+        ]
+        for c, value in enumerate(values):
+            cell = table.cell(r_idx, c)
+            cell.fill.solid()
+            cell.fill.fore_color.rgb = RGBColor(255, 255, 255)
+            set_cell_text(cell, str(value), bold=False, font_size=body_font, header=False)
+
+
+def find_text_shape(slide, pattern: str):
+    regex = re.compile(pattern, re.I)
+    for shape in slide.shapes:
+        if hasattr(shape, "text") and regex.search(shape.text or ""):
+            return shape
+    return None
+
+
+def add_subtitle_text(slide, text: str, left, top, width, height) -> None:
+    box = slide.shapes.add_textbox(left, top, width, height)
+    tf = box.text_frame
+    tf.clear()
+    p = tf.paragraphs[0]
+    p.text = text
+    p.alignment = PP_ALIGN.LEFT
+    for run in p.runs:
+        run.font.name = "Arial"
+        run.font.size = Pt(18)
+        run.font.bold = False
+        run.font.color.rgb = RGBColor(60, 60, 60)
+
+
+def replace_logo_placeholder(slide, olta: str) -> None:
+    placeholder = find_text_shape(slide, r"\[LOGO OLTA\]")
+    left = placeholder.left if placeholder is not None else Inches(1.33)
+    top = placeholder.top if placeholder is not None else Inches(0.55)
+    width = placeholder.width if placeholder is not None else Inches(4.0)
+    height = placeholder.height if placeholder is not None else Inches(0.55)
+    if placeholder is not None:
+        remove_shape(placeholder)
+
+    logo_path = get_logo_path(olta)
+    if logo_path:
+        try:
+            slide.shapes.add_picture(str(logo_path), left, top, height=height)
+            return
+        except Exception:
+            pass
+    add_subtitle_text(slide, normalize_olta_for_ppt(olta), left, top, width, height)
+
+
+def populate_detail_slide(slide, newsletter_groups: list[pd.DataFrame]) -> None:
+    """Popola una slide dettaglio con una o due newsletter della stessa OLTA."""
+    if not newsletter_groups:
+        return
+    first_group = newsletter_groups[0]
+    olta = cleanup_field(first_group["OLTA MITTENTE"].dropna().astype(str).iloc[0]) if not first_group.empty else ""
+    replace_logo_placeholder(slide, olta)
+
+    for shape in list(slide.shapes):
+        if getattr(shape, "has_table", False):
+            remove_shape(shape)
+
+    subtitle_shape = find_text_shape(slide, r"Newsletter .*\[tipologia newsletter\]|Newsletter gg/mm/aaaa")
+    if subtitle_shape is not None:
+        subtitle_shape.text = newsletter_group_title(first_group)
+        subtitle_left, subtitle_width, subtitle_height = subtitle_shape.left, subtitle_shape.width, subtitle_shape.height
+    else:
+        subtitle_left, subtitle_width, subtitle_height = Inches(1.33), Inches(12.5), Inches(0.6)
+        add_subtitle_text(slide, newsletter_group_title(first_group), subtitle_left, Inches(1.37), subtitle_width, subtitle_height)
+
+    table_left = Inches(1.33)
+    table_width = Inches(17.35)
+
+    if len(newsletter_groups) == 1:
+        add_ppt_table(slide, first_group, table_left, Inches(2.55), table_width, Inches(6.75), compact=len(first_group) > 7)
+    else:
+        add_ppt_table(slide, first_group, table_left, Inches(2.15), table_width, Inches(2.75), compact=True)
+        second_group = newsletter_groups[1]
+        add_subtitle_text(slide, newsletter_group_title(second_group), subtitle_left, Inches(5.20), subtitle_width, subtitle_height)
+        add_ppt_table(slide, second_group, table_left, Inches(5.95), table_width, Inches(3.00), compact=True)
+
+
+def build_powerpoint(df: pd.DataFrame, template_bytes: bytes | None = None) -> BytesIO:
+    """Genera il PowerPoint OLTA sulla base del template prestabilito."""
+    if Presentation is None:
+        raise RuntimeError("La libreria python-pptx non è installata. Aggiungi python-pptx al requirements.txt.")
+
+    if template_bytes:
+        prs = Presentation(BytesIO(template_bytes))
+    else:
+        template_path = get_template_pptx_path()
+        if template_path is None:
+            raise FileNotFoundError("Template PowerPoint non trovato. Carica templates/template_olta.pptx nella repository o usa l'uploader template nell'app.")
+        prs = Presentation(str(template_path))
+
+    if len(prs.slides) < 3:
+        raise ValueError("Il template PowerPoint deve contenere almeno 3 slide: cover, grafico riepilogo e slide dettaglio newsletter.")
+
+    week_info = get_week_info(df)
+    update_title_slide(prs.slides[0], week_info)
+    update_summary_chart_slide(prs.slides[1], week_info, df)
+
+    chunks = pack_newsletter_groups_for_ppt(df)
+    detail_template_slide = prs.slides[2]
+    detail_slides = [detail_template_slide]
+    for _ in range(max(0, len(chunks) - 1)):
+        detail_slides.append(duplicate_slide(prs, detail_template_slide))
+
+    if chunks:
+        for slide, chunk in zip(detail_slides, chunks):
+            populate_detail_slide(slide, chunk)
+    else:
+        populate_detail_slide(detail_template_slide, [])
+
+    output = BytesIO()
+    prs.save(output)
+    output.seek(0)
+    return output
+
+
 def build_excel(df: pd.DataFrame, mail_text: str) -> BytesIO:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -1066,11 +1459,11 @@ def build_excel(df: pd.DataFrame, mail_text: str) -> BytesIO:
 
 st.set_page_config(page_title="OLTA Newsletter Extractor", layout="wide")
 st.title("OLTA Newsletter Extractor")
-st.caption("Versione 0.5 — estrazione rule-based con regole Direct Ferries e La Centrale des Ferries, senza modelli AI")
+st.caption("Versione 0.6 — estrazione rule-based con output Excel e PowerPoint da template")
 
 st.markdown(
     "Carica le newsletter in formato `.msg`, `.eml`, `.html` o `.txt`. "
-    "L'app creerà una sotto-sezione per ciascuna newsletter, con tabella modificabile, confidence, file di origine e proposta mail finale."
+    "L'app creerà una sotto-sezione per ciascuna newsletter, con tabella modificabile, confidence, file di origine, proposta mail e PowerPoint finale da template."
 )
 
 uploaded_files = st.file_uploader(
@@ -1079,8 +1472,20 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True,
 )
 
-with st.expander("Diagnostica loghi", expanded=False):
-    st.caption("Usa questa sezione solo se i loghi non vengono visualizzati su Streamlit Cloud.")
+with st.expander("Template PowerPoint", expanded=False):
+    st.caption(
+        "Di default l'app usa `templates/template_olta.pptx`. "
+        "Se il template non è presente nella repository, puoi caricarlo manualmente qui."
+    )
+    uploaded_template_pptx = st.file_uploader(
+        "Carica template PowerPoint opzionale",
+        type=["pptx"],
+        accept_multiple_files=False,
+        key="template_pptx_uploader",
+    )
+
+with st.expander("Diagnostica loghi e template", expanded=False):
+    st.caption("Usa questa sezione se i loghi o il template PowerPoint non vengono letti su Streamlit Cloud.")
     checked_dirs = []
     for logo_dir in LOGO_DIR_CANDIDATES:
         checked_dirs.append({
@@ -1089,6 +1494,14 @@ with st.expander("Diagnostica loghi", expanded=False):
             "File trovati": ", ".join(sorted([p.name for p in logo_dir.glob("*")])) if logo_dir.exists() else "",
         })
     st.dataframe(pd.DataFrame(checked_dirs), use_container_width=True, hide_index=True)
+
+    checked_templates = []
+    for template_path in TEMPLATE_PPTX_CANDIDATES:
+        checked_templates.append({
+            "Template controllato": str(template_path),
+            "Esiste": template_path.exists(),
+        })
+    st.dataframe(pd.DataFrame(checked_templates), use_container_width=True, hide_index=True)
 
 if uploaded_files:
     all_rows = []
@@ -1156,18 +1569,29 @@ if uploaded_files:
         st.subheader("Proposta Mail")
         mail_text = st.text_area("Bozza mail al cliente", value=mail_text, height=360)
 
+        col_download_excel, col_download_ppt = st.columns(2)
+
         excel_data = build_excel(edited_df, mail_text)
-        st.download_button(
-            "Scarica Excel",
-            data=excel_data,
-            file_name="OLTA_newsletter_output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        st.download_button(
-            "Scarica proposta mail TXT",
-            data=mail_text.encode("utf-8"),
-            file_name="OLTA_newsletter_proposta_mail.txt",
-            mime="text/plain",
-        )
+        with col_download_excel:
+            st.download_button(
+                "Scarica Excel",
+                data=excel_data,
+                file_name="OLTA_newsletter_output.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        with col_download_ppt:
+            try:
+                template_bytes = uploaded_template_pptx.getvalue() if uploaded_template_pptx is not None else None
+                pptx_data = build_powerpoint(edited_df, template_bytes=template_bytes)
+                week_label_for_file = get_week_info(edited_df)["week_label"].replace(" ", "_")
+                st.download_button(
+                    "Scarica PowerPoint",
+                    data=pptx_data,
+                    file_name=f"OLTA_newsletter_{week_label_for_file}.pptx",
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                )
+            except Exception as exc:
+                st.error(f"PowerPoint non generato: {exc}")
 else:
     st.info("Carica uno o più file per iniziare.")

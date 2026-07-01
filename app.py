@@ -17,6 +17,8 @@ try:
     from pptx.dml.color import RGBColor
     from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
     from pptx.util import Inches, Pt
+    from pptx.oxml.xmlchemy import OxmlElement
+    from pptx.oxml.ns import qn
 except Exception:
     Presentation = None
     CategoryChartData = None
@@ -25,6 +27,8 @@ except Exception:
     MSO_ANCHOR = None
     Inches = None
     Pt = None
+    OxmlElement = None
+    qn = None
 
 from copy import deepcopy
 
@@ -1169,8 +1173,29 @@ def get_communication_counts_for_ppt(df: pd.DataFrame) -> list[int]:
     return [int(counts.get(olta, 0)) for olta in PPT_OLTA_CATEGORIES]
 
 
+
+def set_shape_text_style(shape, font_name: str = "Cambria", font_size: int = 24, bold: bool = False, color: tuple[int, int, int] = (0, 0, 0), align=None) -> None:
+    """Applica uno stile uniforme a tutto il testo di una shape."""
+    if not hasattr(shape, "text_frame"):
+        return
+    for paragraph in shape.text_frame.paragraphs:
+        if align is not None:
+            paragraph.alignment = align
+        # python-pptx crea run separati solo se il testo viene manipolato a livello di run;
+        # se non ci sono run, aggiungiamo un run vuoto per garantire l'applicazione dello stile.
+        if not paragraph.runs and paragraph.text:
+            text = paragraph.text
+            paragraph.clear()
+            paragraph.add_run().text = text
+        for run in paragraph.runs:
+            run.font.name = font_name
+            run.font.size = Pt(font_size)
+            run.font.bold = bold
+            run.font.color.rgb = RGBColor(*color)
+
+
 def replace_text_in_slide(slide, replacements: dict[str, str]) -> None:
-    """Sostituisce testo nei textbox mantenendo la struttura semplice del template."""
+    """Sostituisce testo nei textbox del template."""
     for shape in slide.shapes:
         if not hasattr(shape, "text"):
             continue
@@ -1214,10 +1239,23 @@ def update_title_slide(slide, week_info: dict) -> None:
             "lunedì gg/mm/aaaa - venerdì gg/mm/aaaa": week_info["date_range"],
         },
     )
+    # Format richiesto: titolo Cambria Bold 42 bianco, sottotitolo/data Cambria 28 bianco.
+    for shape in slide.shapes:
+        if not hasattr(shape, "text"):
+            continue
+        text = shape.text or ""
+        if "OLTA Newsletter" in text or "Analisi settimanale" in text:
+            set_shape_text_style(shape, font_name="Cambria", font_size=42, bold=True, color=(255, 255, 255), align=PP_ALIGN.LEFT)
+        elif "lunedì" in text and "domenica" in text:
+            set_shape_text_style(shape, font_name="Cambria", font_size=28, bold=False, color=(255, 255, 255), align=PP_ALIGN.LEFT)
 
 
 def update_summary_chart_slide(slide, week_info: dict, df: pd.DataFrame) -> None:
     replace_text_in_slide(slide, {"Week [numero Settimana]": f"Week {week_info['week_number']}"})
+    # Format richiesto: sottotitolo Week XX in Cambria Bold 34.
+    for shape in slide.shapes:
+        if hasattr(shape, "text") and re.fullmatch(r"\s*Week\s+\d+\s*", shape.text or ""):
+            set_shape_text_style(shape, font_name="Cambria", font_size=34, bold=True, color=(0, 0, 0), align=PP_ALIGN.LEFT)
     counts = get_communication_counts_for_ppt(df)
     for shape in slide.shapes:
         if not getattr(shape, "has_chart", False):
@@ -1270,23 +1308,66 @@ def pack_newsletter_groups_for_ppt(df: pd.DataFrame) -> list[list[pd.DataFrame]]
     return chunks
 
 
-def set_cell_text(cell, value: str, bold: bool = False, font_size: int = 10, header: bool = False) -> None:
+def set_cell_border(cell, color: str = "000000", width: str = "12700") -> None:
+    """Imposta bordi neri su tutti i lati di una cella PowerPoint.
+
+    python-pptx non espone un'API pubblica per i bordi delle celle;
+    usiamo quindi l'XML Open Office. width=12700 corrisponde a circa 1 pt.
+    """
+    if OxmlElement is None:
+        return
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    for line_name in ("lnL", "lnR", "lnT", "lnB"):
+        # rimuove eventuali linee precedenti per evitare duplicazioni
+        for existing in list(tcPr.findall(qn(f"a:{line_name}"))):
+            tcPr.remove(existing)
+        ln = OxmlElement(f"a:{line_name}")
+        ln.set("w", width)
+        ln.set("cap", "flat")
+        ln.set("cmpd", "sng")
+        ln.set("algn", "ctr")
+        solidFill = OxmlElement("a:solidFill")
+        srgbClr = OxmlElement("a:srgbClr")
+        srgbClr.set("val", color)
+        solidFill.append(srgbClr)
+        ln.append(solidFill)
+        prstDash = OxmlElement("a:prstDash")
+        prstDash.set("val", "solid")
+        ln.append(prstDash)
+        tcPr.append(ln)
+
+
+def set_cell_text(cell, value: str, bold: bool = False, font_size: int = 24, header: bool = False) -> None:
     value = cleanup_field(value)
     cell.text = value
     try:
         cell.vertical_anchor = MSO_ANCHOR.MIDDLE
     except Exception:
         pass
+    # margini ridotti per far stare meglio il font 24 nel layout del template
+    try:
+        cell.margin_left = Inches(0.06)
+        cell.margin_right = Inches(0.06)
+        cell.margin_top = Inches(0.03)
+        cell.margin_bottom = Inches(0.03)
+    except Exception:
+        pass
     for paragraph in cell.text_frame.paragraphs:
         paragraph.alignment = PP_ALIGN.CENTER if header else PP_ALIGN.LEFT
+        if not paragraph.runs and paragraph.text:
+            text = paragraph.text
+            paragraph.clear()
+            paragraph.add_run().text = text
         for run in paragraph.runs:
             run.font.bold = bold
             run.font.size = Pt(font_size)
-            run.font.name = "Arial"
+            run.font.name = "Cambria"
             if header:
                 run.font.color.rgb = RGBColor(255, 255, 255)
             else:
-                run.font.color.rgb = RGBColor(35, 35, 35)
+                run.font.color.rgb = RGBColor(0, 0, 0)
+    set_cell_border(cell, color="000000")
 
 
 def add_ppt_table(slide, group_df: pd.DataFrame, left, top, width, height, compact: bool = False) -> None:
@@ -1300,13 +1381,22 @@ def add_ppt_table(slide, group_df: pd.DataFrame, left, top, width, height, compa
     table.columns[1].width = int(width * 0.50)
     table.columns[2].width = int(width * 0.25)
 
-    header_font = 9 if compact else 10
-    body_font = 8 if compact else 10
+    # Altezza uniforme delle righe, utile per font Cambria 24.
+    try:
+        row_height = int(height / rows)
+        for row in table.rows:
+            row.height = row_height
+    except Exception:
+        pass
+
+    header_font = 24
+    body_font = 24
     headers = ["COMPAGNIA", "DESTINAZIONE / TRATTA / MERCATO", "SCONTO"]
     for c, header in enumerate(headers):
         cell = table.cell(0, c)
         cell.fill.solid()
-        cell.fill.fore_color.rgb = RGBColor(31, 78, 121)
+        # Colore intestazione richiesto: #033BFE
+        cell.fill.fore_color.rgb = RGBColor(3, 59, 254)
         set_cell_text(cell, header, bold=True, font_size=header_font, header=True)
 
     for r_idx, (_, row) in enumerate(group_df.iterrows(), start=1):
@@ -1338,10 +1428,10 @@ def add_subtitle_text(slide, text: str, left, top, width, height) -> None:
     p.text = text
     p.alignment = PP_ALIGN.LEFT
     for run in p.runs:
-        run.font.name = "Arial"
-        run.font.size = Pt(18)
-        run.font.bold = False
-        run.font.color.rgb = RGBColor(60, 60, 60)
+        run.font.name = "Cambria"
+        run.font.size = Pt(34)
+        run.font.bold = True
+        run.font.color.rgb = RGBColor(0, 0, 0)
 
 
 def replace_logo_placeholder(slide, olta: str) -> None:
@@ -1356,7 +1446,9 @@ def replace_logo_placeholder(slide, olta: str) -> None:
     logo_path = get_logo_path(olta)
     if logo_path:
         try:
-            slide.shapes.add_picture(str(logo_path), left, top, height=height)
+            # Logo leggermente più grande rispetto al placeholder del template.
+            logo_height = int(height * 1.20)
+            slide.shapes.add_picture(str(logo_path), left, top, height=logo_height)
             return
         except Exception:
             pass
@@ -1375,9 +1467,10 @@ def populate_detail_slide(slide, newsletter_groups: list[pd.DataFrame]) -> None:
         if getattr(shape, "has_table", False):
             remove_shape(shape)
 
-    subtitle_shape = find_text_shape(slide, r"Newsletter .*\[tipologia newsletter\]|Newsletter gg/mm/aaaa")
+    subtitle_shape = find_text_shape(slide, r"Newsletter .*\[tipologia newsletter\]|Newsletter gg/mm/aaaa|Newsletter \d{2}/\d{2}/\d{4}")
     if subtitle_shape is not None:
         subtitle_shape.text = newsletter_group_title(first_group)
+        set_shape_text_style(subtitle_shape, font_name="Cambria", font_size=34, bold=True, color=(0, 0, 0), align=PP_ALIGN.LEFT)
         subtitle_left, subtitle_width, subtitle_height = subtitle_shape.left, subtitle_shape.width, subtitle_shape.height
     else:
         subtitle_left, subtitle_width, subtitle_height = Inches(1.33), Inches(12.5), Inches(0.6)
@@ -1387,12 +1480,12 @@ def populate_detail_slide(slide, newsletter_groups: list[pd.DataFrame]) -> None:
     table_width = Inches(17.35)
 
     if len(newsletter_groups) == 1:
-        add_ppt_table(slide, first_group, table_left, Inches(2.55), table_width, Inches(6.75), compact=len(first_group) > 7)
+        add_ppt_table(slide, first_group, table_left, Inches(2.55), table_width, Inches(6.75), compact=False)
     else:
-        add_ppt_table(slide, first_group, table_left, Inches(2.15), table_width, Inches(2.75), compact=True)
+        add_ppt_table(slide, first_group, table_left, Inches(2.15), table_width, Inches(2.75), compact=False)
         second_group = newsletter_groups[1]
         add_subtitle_text(slide, newsletter_group_title(second_group), subtitle_left, Inches(5.20), subtitle_width, subtitle_height)
-        add_ppt_table(slide, second_group, table_left, Inches(5.95), table_width, Inches(3.00), compact=True)
+        add_ppt_table(slide, second_group, table_left, Inches(5.95), table_width, Inches(3.00), compact=False)
 
 
 def build_powerpoint(df: pd.DataFrame, template_bytes: bytes | None = None) -> BytesIO:
@@ -1459,7 +1552,7 @@ def build_excel(df: pd.DataFrame, mail_text: str) -> BytesIO:
 
 st.set_page_config(page_title="OLTA Newsletter Extractor", layout="wide")
 st.title("OLTA Newsletter Extractor")
-st.caption("Versione 0.6 — estrazione rule-based con output Excel e PowerPoint da template")
+st.caption("Versione 0.6.3 — estrazione rule-based con output Excel e PowerPoint formattato da template")
 
 st.markdown(
     "Carica le newsletter in formato `.msg`, `.eml`, `.html` o `.txt`. "

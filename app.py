@@ -1,5 +1,6 @@
 import re
 import tempfile
+import unicodedata
 from pathlib import Path
 from io import BytesIO
 from email import policy
@@ -60,23 +61,32 @@ KNOWN_OLTAS = {
     "NETFERRY": ["netferry"],
     "TRAGHETTIPER": ["traghettiper"],
     "TRAGHETTI.COM": ["traghetti.com"],
-    "DIRECT FERRIES": ["direct ferries"],
-    "LA CENTRALE DES FERRIES": ["la centrale des ferries"],
+    "DIRECT FERRIES": ["direct ferries", "directferries", "direct_ferries"],
+    "LA CENTRALE DES FERRIES": ["la centrale des ferries", "lacentrale", "la centrale", "lacentraledesferries"],
 }
 
 APP_DIR = Path(__file__).parent
-LOGO_DIR = APP_DIR / "assets" / "logos"
 LOGO_WIDTH_PX = 165
 
+# Streamlit Community Cloud usa Linux: i nomi file sono case-sensitive.
+# Per evitare problemi tra "assets/logos" e "logos", maiuscole/minuscole o spazi,
+# l'app cerca i loghi in più percorsi e con più varianti di nome.
+LOGO_DIR_CANDIDATES = [
+    APP_DIR / "assets" / "logos",
+    APP_DIR / "logos",
+    Path.cwd() / "assets" / "logos",
+    Path.cwd() / "logos",
+]
+
 OLTA_LOGO_FILES = {
-    "AFERRY": "aferry.png",
-    "ALLOFERRY": "alloferry.png",
-    "FERRYHOPPER": "ferryhopper.png",
-    "NETFERRY": "netferry.png",
-    "TRAGHETTIPER": "traghettiper.png",
-    "TRAGHETTI.COM": "traghetti_com.png",
-    "DIRECT FERRIES": "direct_ferries.png",
-    "LA CENTRALE DES FERRIES": "la_centrale_des_ferries.png",
+    "AFERRY": ["aferry.png", "AFERRY.png"],
+    "ALLOFERRY": ["alloferry.png", "ALLOFERRY.png", "allo_ferry.png", "ALLO FERRY.png"],
+    "FERRYHOPPER": ["ferryhopper.png", "FERRYHOPPER.png", "ferry_hopper.png"],
+    "NETFERRY": ["netferry.png", "NETFERRY.png"],
+    "TRAGHETTIPER": ["traghettiper.png", "TRAGHETTIPER.png", "traghetti_per.png"],
+    "TRAGHETTI.COM": ["traghetti_com.png", "TRAGHETTICOM.png", "TRAGHETTI.COM.png", "traghetti.com.png"],
+    "DIRECT FERRIES": ["direct_ferries.png", "DIRECT FERRIES.png", "direct ferries.png"],
+    "LA CENTRALE DES FERRIES": ["la_centrale_des_ferries.png", "LA CENTRALE DES FERRIES.png"],
 }
 
 KNOWN_COMPANIES = [
@@ -86,6 +96,8 @@ KNOWN_COMPANIES = [
     "P&O", "Color Line", "Superfast Ferries", "Liberty Lines", "Siremar", "Stena Line",
     "Armas", "Balearia", "SNAV", "Jadrolinija", "Blue Star Ferries", "Seajets",
     "Minoan Lines", "ANEK Lines", "Viking Line", "Finnlines",
+    "Lafasi", "Ventouris Ferries", "Anek Superfast",
+    "Magic Sea Ferries", "Golden Star Ferries", "Tallink Silja",
 ]
 
 KNOWN_DESTINATIONS = [
@@ -99,7 +111,8 @@ KNOWN_DESTINATIONS = [
     "Almeria Ghazouet", "Algéciras Tanger", "Algésiras Tanger", "Algéciras Ceuta",
     "Sète Tanger", "Sète Nador", "Barcelone Tanger", "Barcelone Nador", "Gênes Tanger",
     "Marseille", "Sete", "Sète", "Alger", "Bejaia", "Nador", "Tanger", "Ceuta", "Oran", "Ghazouet",
-    "Albania", "Croazia", "Isole Cicladi", "Svezia", "Finlandia", "Estonia",
+    "Albania", "Croazia", "Croazia e isole italiane", "Isole Greche", "Isole Cicladi",
+    "Svezia", "Finlandia", "Estonia", "Grecia - Turchia", "Grecia-Turchia", "Marocco", "Maroc",
 ]
 
 COMMON_LINES = {
@@ -157,6 +170,29 @@ def filtered_lines(text: str) -> list[str]:
     return [line for line in raw_clean_lines(text) if line not in COMMON_LINES]
 
 
+def html_to_text_with_image_metadata(html: str) -> str:
+    """Estrae il testo HTML aggiungendo anche alt/title delle immagini.
+
+    Alcune newsletter hanno una parte rilevante dentro immagini; quando alt/title
+    sono disponibili, li aggiungiamo al testo per facilitare le regole.
+    """
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    text_parts = [soup.get_text("\n", strip=True)]
+    image_texts = []
+    for img in soup.find_all("img"):
+        for attr in ["alt", "title"]:
+            value = img.get(attr)
+            if value:
+                value = cleanup_field(value)
+                if value and value not in image_texts:
+                    image_texts.append(value)
+    if image_texts:
+        text_parts.append("\n".join(image_texts))
+    return clean_text("\n".join(part for part in text_parts if part))
+
+
 def parse_uploaded_file(uploaded_file) -> dict:
     filename = uploaded_file.name
     suffix = Path(filename).suffix.lower()
@@ -177,9 +213,12 @@ def parse_uploaded_file(uploaded_file) -> dict:
             html_text = str(html_body)
         body = msg.body or ""
         if body and len(body.strip()) > 30:
+            # Se il body testuale è disponibile, lo usiamo come fonte principale.
+            # Gli alt/title delle immagini vengono usati solo quando manca il body,
+            # così evitiamo duplicazioni/false offerte nei template ricchi di immagini.
             text = body
         elif html_text:
-            text = BeautifulSoup(html_text, "html.parser").get_text("\n", strip=True)
+            text = html_to_text_with_image_metadata(html_text)
         else:
             text = ""
         return {"sender": msg.sender or "", "date": msg.date, "subject": msg.subject or "", "text": clean_text(text)}
@@ -212,13 +251,13 @@ def parse_uploaded_file(uploaded_file) -> dict:
             elif msg.get_content_type() == "text/html":
                 html_parts.append(content)
         text = "\n".join(plain_parts) if plain_parts else "\n".join(
-            BeautifulSoup(h, "html.parser").get_text("\n", strip=True) for h in html_parts
+            html_to_text_with_image_metadata(h) for h in html_parts
         )
         return {"sender": sender, "date": date, "subject": subject, "text": clean_text(text)}
 
     if suffix in [".html", ".htm"]:
         raw = data.decode("utf-8", errors="ignore")
-        text = BeautifulSoup(raw, "html.parser").get_text("\n", strip=True)
+        text = html_to_text_with_image_metadata(raw)
         return {"sender": "", "date": None, "subject": "", "text": clean_text(text)}
 
     if suffix == ".txt":
@@ -337,7 +376,7 @@ def infer_tipologia(subject: str, text: str, promo: str) -> str:
     sample = f"{subject}\n{text[:4000]}".lower()
     if re.search(r"\b(coupon|codice|voucher|bon d’achat|code promo|coupon sconto)\b", sample):
         return "Codice sconto"
-    if re.search(r"\b(ultimi giorni|ultimo giorno|last chance|solo oggi|demain)\b", sample):
+    if re.search(r"\b(ultimi giorni|ultimo giorno|last chance|solo oggi|demain|derni[eè]re ligne droite)\b", sample):
         return "Reminder"
     if promo or re.search(r"\b(sconto|offerta|promo|risparmia|remise|offre|a partire da|fino al|jusqu|discount)\b|-\s?\d{1,2}\s?%|\d+\s?€", sample):
         return "Promozione"
@@ -549,6 +588,148 @@ def extract_ferryhopper(parsed: dict, filename: str) -> list[dict]:
     return rows
 
 
+def extract_direct_ferries(parsed: dict, filename: str) -> list[dict]:
+    """Estrazione specifica per newsletter Direct Ferries.
+
+    Le newsletter Direct Ferries sono organizzate in blocchi separati da CTA
+    "Cerca Ora": destinazione, meccanica promozionale e compagnia.
+    """
+    lines = raw_clean_lines(parsed.get("text", ""))
+    cleaned_lines = []
+    for line in lines:
+        if re.search(r"(?i)caution:|questa mail proviene|direct ferries ltd|cancella l.iscrizione|tutti i diritti|versione online|contattarci", line):
+            continue
+        if re.search(r"(?i)^prenota oggi|^mare, sole|godersi le vacanze|^fino al 50% di$|^sconto sui traghetti|^sali a bordo|^esplora il nostro blog|^alla scoperta|^spiagge segrete|^per saperne|^nota bene", line):
+            continue
+        if line.startswith("<data:image"):
+            continue
+        cleaned_lines.append(line)
+
+    # Split in blocchi tra una CTA e l'altra.
+    blocks, current = [], []
+    for line in cleaned_lines:
+        if re.search(r"(?i)^cerca\s+ora$|^cerca$|^ora$", line):
+            if current:
+                blocks.append(current)
+                current = []
+        else:
+            current.append(line)
+    if current:
+        blocks.append(current)
+
+    rows, seen = [], set()
+    for block in blocks:
+        block = [cleanup_field(x).replace("*", "") for x in block if cleanup_field(x)]
+        if not block:
+            continue
+        block_text = "\n".join(block)
+        if not re.search(r"(?i)\bcon\s+[A-Za-zÀ-ÿ]|\d{1,2}\s?%", block_text):
+            continue
+
+        # Prima riga realmente descrittiva = destinazione/mercato/tratta.
+        destination = ""
+        for line in block:
+            if re.search(r"(?i)^fino al|^\d{1,2}\s?%|^con\s+|sconto|biglietti", line):
+                continue
+            if len(line) > 2:
+                destination = line.strip(" .")
+                break
+        if not destination:
+            destination = find_destinations(block_text)
+
+        # Caso speciale: blocco con più offerte nella stessa destinazione (es. Grecia).
+        bullet_matches = re.findall(r"(?i)(\d{1,2}\s?%\s+di\s+sconto)\s+con\s+([^\n]+)", block_text) if re.search(r"(?im)^Fino\s+al:?$", block_text) else []
+        if bullet_matches:
+            for promo_part, company_part in bullet_matches:
+                promo = promo_part.strip()
+                if not re.search(r"(?i)^fino", promo):
+                    promo = f"Fino al {promo}"
+                company = cleanup_field(company_part)
+                key = (destination, company, promo)
+                if key not in seen:
+                    seen.add(key)
+                    rows.append(make_row(parsed, filename, "Promozione", company, destination, promo, 0.95, "Regola specifica Direct Ferries: blocco multi-offerta"))
+            continue
+
+        promo = extract_promo_phrase(block_text)
+        # Integra condizioni testuali immediatamente successive alla percentuale.
+        if promo and re.search(r"(?i)sui biglietti con rientro in giornata", block_text) and "rientro in giornata" not in promo.lower():
+            promo = f"{promo} sui biglietti con rientro in giornata"
+
+        company = ""
+        match_company = re.search(r"(?im)^con\s+([^\n]+)$", block_text)
+        if match_company:
+            company = cleanup_field(match_company.group(1))
+        if not company:
+            company = find_companies(block_text)
+        if not promo or not company:
+            continue
+        key = (destination, company, promo)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(make_row(parsed, filename, "Promozione", company, destination, promo, 0.95, "Regola specifica Direct Ferries: blocco offerta"))
+
+    return rows
+
+
+def extract_la_centrale_des_ferries(parsed: dict, filename: str) -> list[dict]:
+    """Estrazione specifica per La Centrale des Ferries.
+
+    Questi template sono spesso image-based: in assenza di testo completo nelle
+    immagini, la regola usa oggetto + preheader/testo visibile.
+    """
+    subject = cleanup_field(parsed.get("subject", ""))
+    lines = raw_clean_lines(parsed.get("text", ""))
+    useful_lines = []
+    for line in lines:
+        line_clean = cleanup_field(line)
+        if not line_clean or line_clean == subject:
+            continue
+        if len(line_clean) > 180:
+            continue
+        if re.search(r"(?i)désinscrire|newsletter|sendibm|contacter|conditions|cliquez ici", line_clean):
+            continue
+        if re.match(r"^<.*>$", line_clean):
+            continue
+        useful_lines.append(line_clean)
+        if len(useful_lines) >= 5:
+            break
+
+    full = cleanup_field("\n".join([subject] + useful_lines))
+    full_lower = full.lower()
+
+    destination = find_destinations(full)
+    if re.search(r"(?i)\bmaroc\b|tanger|nador", full):
+        routes = []
+        for route in ["Algeciras-Tanger", "Almeria-Nador", "Almería-Nador", "Sète-Nador", "Sète-Tanger", "Marseille-Tanger"]:
+            if re.search(re.escape(route), full, re.I):
+                routes.append(route)
+        destination = "Marocco" + (" / " + ", ".join(routes) if routes else "")
+    elif re.search(r"(?i)alg[eé]rie|alger|oran|bejaia|béjaïa", full):
+        destination = "Algeria"
+
+    if re.search(r"(?i)payez en plusieurs fois|paiement en plusieurs fois|ancv", full):
+        promo = "pagamento in più rate / ANCV"
+    elif re.search(r"(?i)meilleur prix", full):
+        promo = "ferry al miglior prezzo"
+    elif re.search(r"(?i)promo", full):
+        promo = "prenotazione ferry in promo"
+    else:
+        promo = "comunicazione commerciale / vacanze"
+
+    if re.search(r"(?i)derni[eè]re ligne droite", full):
+        tipologia = "Reminder"
+    elif re.search(r"(?i)promo|meilleur prix|prix|ancv|payez", full):
+        tipologia = "Promozione"
+    else:
+        tipologia = "Comunicazione generica"
+
+    note = "Regola specifica La Centrale des Ferries: estrazione da oggetto/preheader; template prevalentemente image-based"
+    confidence = 0.78 if useful_lines else 0.62
+    return [make_row(parsed, filename, tipologia, "", destination, promo, confidence, note)]
+
+
 def extract_rows(parsed: dict, filename: str) -> list[dict]:
     olta = get_olta(parsed.get("sender", ""), filename)
     try:
@@ -562,6 +743,10 @@ def extract_rows(parsed: dict, filename: str) -> list[dict]:
             rows = extract_netferry(parsed, filename)
         elif olta == "FERRYHOPPER":
             rows = extract_ferryhopper(parsed, filename)
+        elif olta == "DIRECT FERRIES":
+            rows = extract_direct_ferries(parsed, filename)
+        elif olta == "LA CENTRALE DES FERRIES":
+            rows = extract_la_centrale_des_ferries(parsed, filename)
         else:
             rows = []
         if not rows:
@@ -627,14 +812,42 @@ def render_source_file(file_name: str) -> None:
     )
 
 
+def normalize_logo_key(value: str) -> str:
+    """Normalizza nomi OLTA/file logo per matching robusto su Streamlit Cloud."""
+    value = cleanup_field(value).lower()
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]", "", value)
+
+
 def get_logo_path(olta: str) -> Path | None:
-    """Restituisce il path del logo associato all'OLTA, se disponibile."""
-    olta = cleanup_field(olta).upper()
-    filename = OLTA_LOGO_FILES.get(olta)
-    if not filename:
-        return None
-    logo_path = LOGO_DIR / filename
-    return logo_path if logo_path.exists() else None
+    """Restituisce il path del logo associato all'OLTA, se disponibile.
+
+    Cerca sia in assets/logos sia in logos e gestisce differenze di maiuscole,
+    spazi, underscore e punti nei nomi file.
+    """
+    olta_clean = cleanup_field(olta).upper()
+    expected_names = OLTA_LOGO_FILES.get(olta_clean, [])
+
+    # 1) Tentativo diretto con le varianti note.
+    for logo_dir in LOGO_DIR_CANDIDATES:
+        for filename in expected_names:
+            logo_path = logo_dir / filename
+            if logo_path.exists():
+                return logo_path
+
+    # 2) Fallback robusto: scansione dei file immagine nelle cartelle candidate.
+    target_keys = {normalize_logo_key(olta_clean)}
+    target_keys.update(normalize_logo_key(Path(name).stem) for name in expected_names)
+
+    for logo_dir in LOGO_DIR_CANDIDATES:
+        if not logo_dir.exists():
+            continue
+        for logo_path in list(logo_dir.glob("*.png")) + list(logo_dir.glob("*.jpg")) + list(logo_dir.glob("*.jpeg")):
+            if normalize_logo_key(logo_path.stem) in target_keys:
+                return logo_path
+
+    return None
 
 
 def render_newsletter_header(group_df: pd.DataFrame, section_title: str) -> None:
@@ -853,7 +1066,7 @@ def build_excel(df: pd.DataFrame, mail_text: str) -> BytesIO:
 
 st.set_page_config(page_title="OLTA Newsletter Extractor", layout="wide")
 st.title("OLTA Newsletter Extractor")
-st.caption("Versione 0.4 — estrazione rule-based, loghi OLTA integrati, senza modelli AI")
+st.caption("Versione 0.5 — estrazione rule-based con regole Direct Ferries e La Centrale des Ferries, senza modelli AI")
 
 st.markdown(
     "Carica le newsletter in formato `.msg`, `.eml`, `.html` o `.txt`. "
@@ -865,6 +1078,17 @@ uploaded_files = st.file_uploader(
     type=["msg", "eml", "html", "htm", "txt"],
     accept_multiple_files=True,
 )
+
+with st.expander("Diagnostica loghi", expanded=False):
+    st.caption("Usa questa sezione solo se i loghi non vengono visualizzati su Streamlit Cloud.")
+    checked_dirs = []
+    for logo_dir in LOGO_DIR_CANDIDATES:
+        checked_dirs.append({
+            "Percorso controllato": str(logo_dir),
+            "Esiste": logo_dir.exists(),
+            "File trovati": ", ".join(sorted([p.name for p in logo_dir.glob("*")])) if logo_dir.exists() else "",
+        })
+    st.dataframe(pd.DataFrame(checked_dirs), use_container_width=True, hide_index=True)
 
 if uploaded_files:
     all_rows = []

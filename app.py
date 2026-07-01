@@ -1552,7 +1552,7 @@ def build_excel(df: pd.DataFrame, mail_text: str) -> BytesIO:
 
 st.set_page_config(page_title="OLTA Newsletter Extractor", layout="wide")
 st.title("OLTA Newsletter Extractor")
-st.caption("Versione 0.6.3 — estrazione rule-based con output Excel e PowerPoint formattato da template")
+st.caption("Versione 0.6.4 — estrazione rule-based con output Excel e PowerPoint formattato da template")
 
 st.markdown(
     "Carica le newsletter in formato `.msg`, `.eml`, `.html` o `.txt`. "
@@ -1576,25 +1576,6 @@ with st.expander("Template PowerPoint", expanded=False):
         accept_multiple_files=False,
         key="template_pptx_uploader",
     )
-
-with st.expander("Diagnostica loghi e template", expanded=False):
-    st.caption("Usa questa sezione se i loghi o il template PowerPoint non vengono letti su Streamlit Cloud.")
-    checked_dirs = []
-    for logo_dir in LOGO_DIR_CANDIDATES:
-        checked_dirs.append({
-            "Percorso controllato": str(logo_dir),
-            "Esiste": logo_dir.exists(),
-            "File trovati": ", ".join(sorted([p.name for p in logo_dir.glob("*")])) if logo_dir.exists() else "",
-        })
-    st.dataframe(pd.DataFrame(checked_dirs), use_container_width=True, hide_index=True)
-
-    checked_templates = []
-    for template_path in TEMPLATE_PPTX_CANDIDATES:
-        checked_templates.append({
-            "Template controllato": str(template_path),
-            "Esiste": template_path.exists(),
-        })
-    st.dataframe(pd.DataFrame(checked_templates), use_container_width=True, hide_index=True)
 
 if uploaded_files:
     all_rows = []
